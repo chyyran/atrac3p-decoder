@@ -10,12 +10,10 @@
 #![allow(dead_code)]
 #![allow(non_upper_case_globals)]
 
-use bitstream_io::{
-    huffman::{compile_read_tree, ReadHuffmanTree},
-    BigEndian, BitReader, LittleEndian,
-};
-use lazy_static::lazy_static;
-use num::{One, Zero};
+use bitstream_io::BitRead;
+use num::{One, ToPrimitive, Zero};
+use std::io;
+use std::sync::LazyLock;
 
 pub(crate) const SUBBANDS: usize = 16;
 pub(crate) const SUBBAND_SAMPLES: usize = 128;
@@ -24,228 +22,289 @@ pub(crate) const POWER_COMP_OFF: u8 = 15;
 pub(crate) const MDCT_SIZE: usize = SUBBAND_SAMPLES * 2;
 pub(crate) const PQF_FIR_LEN: usize = 12;
 
-lazy_static! {
-    pub(crate) static ref WL_VLC_TABS: [Box<[ReadHuffmanTree<BigEndian, i32>]>; 4] = {
-        let codes_1 = [0, 2, 3];
-        let codes_2 = [0, 4, 5, 6, 7];
-        let codes_3 = [0, 4, 0xC, 0x1E, 0x1F, 0xD, 0xE, 5];
-        let codes_4 = [0, 4, 0xC, 0xD, 0x1E, 0x1F, 0xE, 5];
-
-        let bits_1 = [1, 2, 2];
-        let bits_2 = [1, 3, 3, 3, 3];
-        let bits_3 = [1, 3, 4, 5, 5, 4, 4, 3];
-        let bits_4 = [1, 3, 4, 4, 5, 5, 4, 3];
-
-        let xlat_1 = [0, 1, 7];
-        let xlat_2 = [0, 1, 2, 6, 7];
-
-        let tab_1 = build_huffman(&codes_1, &bits_1, Some(&xlat_1));
-        let tab_2 = build_huffman(&codes_2, &bits_2, Some(&xlat_2));
-        let tab_3 = build_huffman(&codes_3, &bits_3, None);
-        let tab_4 = build_huffman(&codes_4, &bits_4, None);
-
-        [tab_1, tab_2, tab_3, tab_4]
-    };
-    pub(crate) static ref SF_VLC_TABS: [Box<[ReadHuffmanTree<BigEndian, i32>]>; 8] = {
-        let codes_1 = [
-            0, 2, 3, 4, 5, 0xC, 0xD, 0xE0, 0xE1, 0xE2, 0xE3, 0xE4, 0xE5, 0xE6, 0x1CE, 0x1CF, 0x1D0,
-            0x1D1, 0x1D2, 0x1D3, 0x1D4, 0x1D5, 0x1D6, 0x1D7, 0x1D8, 0x1D9, 0x1DA, 0x1DB, 0x1DC,
-            0x1DD, 0x1DE, 0x1DF, 0x1E0, 0x1E1, 0x1E2, 0x1E3, 0x1E4, 0x1E5, 0x1E6, 0x1E7, 0x1E8,
-            0x1E9, 0x1EA, 0x1EB, 0x1EC, 0x1ED, 0x1EE, 0x1EF, 0x1F0, 0x1F1, 0x1F2, 0x1F3, 0x1F4,
-            0x1F5, 0x1F6, 0x1F7, 0x1F8, 0x1F9, 0x1FA, 0x1FB, 0x1FC, 0x1FD, 0x1FE, 0x1FF,
-        ];
-        let codes_2 = [
-            0, 4, 0x18, 0x19, 0x70, 0x1CA, 0x1CB, 0x1CC, 0x1CD, 0x1CE, 0x1CF, 0x1D0, 0x1D1, 0x1D2,
-            0x1D3, 0x1D4, 0x1D5, 0x1D6, 0x1D7, 0x1D8, 0x1D9, 0x1DA, 0x1DB, 0x1DC, 0x1DD, 0x1DE,
-            0x1DF, 0x1E0, 0x1E1, 0x1E2, 0x1E3, 0x1E4, 0x1E5, 0x1E6, 0x1E7, 0x1E8, 0x1E9, 0x1EA,
-            0x1EB, 0x1EC, 0x1ED, 0x1EE, 0x1EF, 0x1F0, 0x1F1, 0x1F2, 0x1F3, 0x1F4, 0x1F5, 0x1F6,
-            0x1F7, 0x1F8, 0x1F9, 0x1FA, 0x1FB, 0x1FC, 0x1FD, 0x1FE, 0x1FF, 0xE4, 0x71, 0x1A, 0x1B,
-            5,
-        ];
-        let codes_3 = [
-            0, 2, 3, 0x18, 0x19, 0x70, 0x1CC, 0x1CD, 0x1CE, 0x1CF, 0x1D0, 0x1D1, 0x1D2, 0x1D3,
-            0x1D4, 0x1D5, 0x1D6, 0x1D7, 0x1D8, 0x1D9, 0x1DA, 0x1DB, 0x1DC, 0x1DD, 0x1DE, 0x1DF,
-            0x1E0, 0x1E1, 0x1E2, 0x1E3, 0x1E4, 0x1E5, 0x1E6, 0x1E7, 0x1E8, 0x1E9, 0x1EA, 0x1EB,
-            0x1EC, 0x1ED, 0x1EE, 0x1EF, 0x1F0, 0x1F1, 0x1F2, 0x1F3, 0x1F4, 0x1F5, 0x1F6, 0x1F7,
-            0x1F8, 0x1F9, 0x1FA, 0x1FB, 0x1FC, 0x1FD, 0x1FE, 0x1FF, 0x71, 0x72, 0x1A, 0x1B, 4, 5,
-        ];
-        let codes_4 = [
-            0, 2, 3, 4, 5, 0xC, 0xD, 0x38, 0x39, 0x3A, 0x3B, 0x3C, 0, 0x3D, 0x3E, 0x3F,
-        ];
-        let codes_5 = [
-            0, 4, 0xC, 0x1C, 0x78, 0x79, 0x7A, 0x7B, 0, 0x7C, 0x7D, 0x7E, 0x7F, 0x1D, 0xD, 5,
-        ];
-        let codes_6 = [
-            0, 2, 3, 0xC, 0x1C, 0x3C, 0x7C, 0x7D, 0, 0x7E, 0x7F, 0x3D, 0x1D, 0xD, 4, 5,
-        ];
-
-        let bits_1 = [
-            2, 3, 3, 3, 3, 4, 4, 8, 8, 8, 8, 8, 8, 8, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9,
-            9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9,
-            9, 9, 9, 9, 9, 9,
-        ];
-        let bits_2 = [
-            1, 3, 5, 5, 7, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9,
-            9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9,
-            9, 8, 7, 5, 5, 3,
-        ];
-        let bits_3 = [
-            2, 3, 3, 5, 5, 7, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9,
-            9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9,
-            7, 7, 5, 5, 3, 3,
-        ];
-        let bits_4 = [2, 3, 3, 3, 3, 4, 4, 6, 6, 6, 6, 6, 0, 6, 6, 6];
-        let bits_5 = [1, 3, 4, 5, 7, 7, 7, 7, 0, 7, 7, 7, 7, 5, 4, 3];
-        let bits_6 = [2, 3, 3, 4, 5, 6, 7, 7, 0, 7, 7, 6, 5, 4, 3, 3];
-
-        let xlat_1 = [
-            0, 1, 61, 62, 63, 2, 60, 3, 4, 5, 6, 57, 58, 59, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
-            17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38,
-            39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56,
-        ];
-        let xlat_2 = [
-            0, 1, 2, 62, 63, 3, 61, 4, 5, 6, 57, 58, 59, 60, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
-            17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38,
-            39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56,
-        ];
-        let xlat_4 = [0, 1, 13, 14, 15, 2, 12, 3, 4, 5, 6, 7, 8, 9, 10, 11];
-        let xlat_5 = [0, 1, 2, 14, 15, 3, 13, 4, 5, 6, 7, 9, 8, 10, 11, 12];
-
-        let tab_1 = build_huffman(&codes_1, &bits_1, Some(&xlat_1));
-        let tab_2 = build_huffman(&codes_1, &bits_1, Some(&xlat_2));
-        let tab_3 = build_huffman(&codes_2, &bits_2, None);
-        let tab_4 = build_huffman(&codes_3, &bits_3, None);
-        let tab_5 = build_huffman(&codes_4, &bits_4, Some(&xlat_4));
-        let tab_6 = build_huffman(&codes_4, &bits_4, Some(&xlat_5));
-        let tab_7 = build_huffman(&codes_5, &bits_5, None);
-        let tab_8 = build_huffman(&codes_6, &bits_6, None);
-
-        [tab_1, tab_2, tab_3, tab_4, tab_5, tab_6, tab_7, tab_8]
-    };
-    pub(crate) static ref CT_VLC_TABS: [Box<[ReadHuffmanTree<BigEndian, i32>]>; 4] = {
-        let codes_1 = [0, 2, 6, 7];
-        let codes_2 = [0, 2, 3, 4, 5, 6, 0xE, 0xF];
-        let codes_3 = [0, 4, 0xA, 0xB, 0xC, 0xD, 0xE, 0xF];
-
-        let bits_1 = [1, 2, 3, 3];
-        let bits_2 = [2, 3, 3, 3, 3, 3, 4, 4];
-        let bits_3 = [1, 3, 4, 4, 4, 4, 4, 4];
-
-        let xlat_1 = [0, 1, 2, 3, 6, 7, 4, 5];
-
-        let tab_1 = build_huffman(&codes_1, &bits_1, None);
-        let tab_2 = build_huffman(&codes_2, &bits_2, None);
-        let tab_3 = build_huffman(&codes_2, &bits_2, Some(&xlat_1));
-        let tab_4 = build_huffman(&codes_3, &bits_3, None);
-
-        [tab_1, tab_2, tab_3, tab_4]
-    };
-    pub(crate) static ref GAIN_VLC_TABS: Vec<Box<[ReadHuffmanTree<BigEndian, u16>]>> = {
-        let gain_cbs = [
-            &npoints1_cb[..],
-            &npoints1_cb,
-            &lev1_cb,
-            &lev2_cb,
-            &lev3_cb,
-            &lev4_cb,
-            &loc3_cb,
-            &loc1_cb,
-            &loc4_cb,
-            &loc2_cb,
-            &loc5_cb,
-        ];
-
-        let gain_xlats = [
-            None,
-            Some(&npoints2_xlat[..]),
-            Some(&lev1_xlat),
-            Some(&lev2_xlat),
-            Some(&lev3_xlat),
-            Some(&lev4_xlat),
-            Some(&loc3_xlat),
-            Some(&loc1_xlat),
-            Some(&loc4_xlat),
-            Some(&loc2_xlat),
-            Some(&loc5_xlat),
-        ];
-
-        let mut tabs: Vec<Box<[ReadHuffmanTree<BigEndian, u16>]>> = vec![];
-
-        for i in 0..11 {
-            let tab = build_canonical_huff(gain_cbs[i], gain_xlats[i]);
-            tabs.push(tab);
-        }
-
-        tabs
-    };
-    pub(crate) static ref TONE_VLC_TABS: Vec<Box<[ReadHuffmanTree<BigEndian, u16>]>> = {
-        let tone_cbs = [
-            &tonebands_cb[..],
-            &numwavs1_cb,
-            &numwavs2_cb,
-            &wav_ampsf1_cb,
-            &wav_ampsf2_cb,
-            &wav_ampsf3_cb,
-            &freq_cb,
-        ];
-
-        let tone_xlats = [
-            None,
-            None,
-            Some(&numwavs2_xlat[..]),
-            Some(&wav_ampsf1_xlat),
-            Some(&wav_ampsf2_xlat),
-            Some(&wav_ampsf3_xlat),
-            Some(&freq_xlat),
-        ];
-
-        let mut tabs: Vec<Box<[ReadHuffmanTree<BigEndian, u16>]>> = vec![];
-
-        for i in 0..7 {
-            let tab = build_canonical_huff(tone_cbs[i], tone_xlats[i]);
-            tabs.push(tab);
-        }
-
-        tabs
-    };
-    pub(crate) static ref SINE_64: [f32; 64] = {
-        let mut window = [0.0; 64];
-        sine_window(&mut window, 64);
-        window
-    };
-    pub(crate) static ref SINE_128: [f32; 128] = {
-        let mut window = [0.0; 128];
-        sine_window(&mut window, 128);
-        window
-    };
-    pub(crate) static ref SINE_TABLE: [f32; 2048] = {
-        let mut sine_table = [0.0f32; 2048];
-
-        for i in 0..2048 {
-            sine_table[i] = ((std::f32::consts::PI * 2.0) * i as f32 / 2048.0).sin()
-        }
-
-        sine_table
-    };
-    pub(crate) static ref HANN_WINDOW: [f32; 256] = {
-        let mut hann_window = [0.0f32; 256];
-
-        for i in 0..256 {
-            hann_window[i] = (1.0 - ((std::f32::consts::PI * 2.0) * i as f32 / 256.0).cos()) * 0.5;
-        }
-
-        hann_window
-    };
-    pub(crate) static ref AMP_SF_TAB: [f32; 64] = {
-        let mut amp_sf_tab = [0.0f32; 64];
-
-        for i in 0..64 {
-            amp_sf_tab[i] = ((i as f32 - 3.0) / 4.0).exp2()
-        }
-
-        amp_sf_tab
-    };
+pub(crate) struct HuffmanTree<T> {
+    nodes: Vec<HuffmanNode<T>>,
 }
+
+struct HuffmanNode<T> {
+    value: Option<T>,
+    children: [Option<usize>; 2],
+}
+
+impl<T> HuffmanNode<T> {
+    fn new() -> Self {
+        Self {
+            value: None,
+            children: [None; 2],
+        }
+    }
+}
+
+impl<T: Copy> HuffmanTree<T> {
+    fn new() -> Self {
+        Self {
+            nodes: vec![HuffmanNode::new()],
+        }
+    }
+
+    fn insert(&mut self, code: u64, bits: u8, value: T) {
+        let mut node = 0;
+
+        for shift in (0..bits).rev() {
+            assert!(self.nodes[node].value.is_none());
+
+            let bit = ((code >> shift) & 1) as usize;
+            node = match self.nodes[node].children[bit] {
+                Some(child) => child,
+                None => {
+                    let child = self.nodes.len();
+                    self.nodes.push(HuffmanNode::new());
+                    self.nodes[node].children[bit] = Some(child);
+                    child
+                }
+            };
+        }
+
+        assert!(self.nodes[node].value.is_none());
+        assert_eq!(self.nodes[node].children, [None; 2]);
+        self.nodes[node].value = Some(value);
+    }
+
+    pub(crate) fn read<R: BitRead + ?Sized>(&self, reader: &mut R) -> io::Result<T> {
+        let mut node = 0;
+
+        loop {
+            let bit = reader.read_bit()? as usize;
+            node = self.nodes[node].children[bit].ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "invalid Huffman code")
+            })?;
+
+            if let Some(value) = self.nodes[node].value {
+                return Ok(value);
+            }
+        }
+    }
+}
+
+pub(crate) static WL_VLC_TABS: LazyLock<[HuffmanTree<i32>; 4]> = LazyLock::new(|| {
+    let codes_1 = [0, 2, 3];
+    let codes_2 = [0, 4, 5, 6, 7];
+    let codes_3 = [0, 4, 0xC, 0x1E, 0x1F, 0xD, 0xE, 5];
+    let codes_4 = [0, 4, 0xC, 0xD, 0x1E, 0x1F, 0xE, 5];
+
+    let bits_1 = [1, 2, 2];
+    let bits_2 = [1, 3, 3, 3, 3];
+    let bits_3 = [1, 3, 4, 5, 5, 4, 4, 3];
+    let bits_4 = [1, 3, 4, 4, 5, 5, 4, 3];
+
+    let xlat_1 = [0, 1, 7];
+    let xlat_2 = [0, 1, 2, 6, 7];
+
+    let tab_1 = build_huffman(&codes_1, &bits_1, Some(&xlat_1));
+    let tab_2 = build_huffman(&codes_2, &bits_2, Some(&xlat_2));
+    let tab_3 = build_huffman(&codes_3, &bits_3, None);
+    let tab_4 = build_huffman(&codes_4, &bits_4, None);
+
+    [tab_1, tab_2, tab_3, tab_4]
+});
+pub(crate) static SF_VLC_TABS: LazyLock<[HuffmanTree<i32>; 8]> = LazyLock::new(|| {
+    let codes_1 = [
+        0, 2, 3, 4, 5, 0xC, 0xD, 0xE0, 0xE1, 0xE2, 0xE3, 0xE4, 0xE5, 0xE6, 0x1CE, 0x1CF, 0x1D0,
+        0x1D1, 0x1D2, 0x1D3, 0x1D4, 0x1D5, 0x1D6, 0x1D7, 0x1D8, 0x1D9, 0x1DA, 0x1DB, 0x1DC, 0x1DD,
+        0x1DE, 0x1DF, 0x1E0, 0x1E1, 0x1E2, 0x1E3, 0x1E4, 0x1E5, 0x1E6, 0x1E7, 0x1E8, 0x1E9, 0x1EA,
+        0x1EB, 0x1EC, 0x1ED, 0x1EE, 0x1EF, 0x1F0, 0x1F1, 0x1F2, 0x1F3, 0x1F4, 0x1F5, 0x1F6, 0x1F7,
+        0x1F8, 0x1F9, 0x1FA, 0x1FB, 0x1FC, 0x1FD, 0x1FE, 0x1FF,
+    ];
+    let codes_2 = [
+        0, 4, 0x18, 0x19, 0x70, 0x1CA, 0x1CB, 0x1CC, 0x1CD, 0x1CE, 0x1CF, 0x1D0, 0x1D1, 0x1D2,
+        0x1D3, 0x1D4, 0x1D5, 0x1D6, 0x1D7, 0x1D8, 0x1D9, 0x1DA, 0x1DB, 0x1DC, 0x1DD, 0x1DE, 0x1DF,
+        0x1E0, 0x1E1, 0x1E2, 0x1E3, 0x1E4, 0x1E5, 0x1E6, 0x1E7, 0x1E8, 0x1E9, 0x1EA, 0x1EB, 0x1EC,
+        0x1ED, 0x1EE, 0x1EF, 0x1F0, 0x1F1, 0x1F2, 0x1F3, 0x1F4, 0x1F5, 0x1F6, 0x1F7, 0x1F8, 0x1F9,
+        0x1FA, 0x1FB, 0x1FC, 0x1FD, 0x1FE, 0x1FF, 0xE4, 0x71, 0x1A, 0x1B, 5,
+    ];
+    let codes_3 = [
+        0, 2, 3, 0x18, 0x19, 0x70, 0x1CC, 0x1CD, 0x1CE, 0x1CF, 0x1D0, 0x1D1, 0x1D2, 0x1D3, 0x1D4,
+        0x1D5, 0x1D6, 0x1D7, 0x1D8, 0x1D9, 0x1DA, 0x1DB, 0x1DC, 0x1DD, 0x1DE, 0x1DF, 0x1E0, 0x1E1,
+        0x1E2, 0x1E3, 0x1E4, 0x1E5, 0x1E6, 0x1E7, 0x1E8, 0x1E9, 0x1EA, 0x1EB, 0x1EC, 0x1ED, 0x1EE,
+        0x1EF, 0x1F0, 0x1F1, 0x1F2, 0x1F3, 0x1F4, 0x1F5, 0x1F6, 0x1F7, 0x1F8, 0x1F9, 0x1FA, 0x1FB,
+        0x1FC, 0x1FD, 0x1FE, 0x1FF, 0x71, 0x72, 0x1A, 0x1B, 4, 5,
+    ];
+    let codes_4 = [
+        0, 2, 3, 4, 5, 0xC, 0xD, 0x38, 0x39, 0x3A, 0x3B, 0x3C, 0, 0x3D, 0x3E, 0x3F,
+    ];
+    let codes_5 = [
+        0, 4, 0xC, 0x1C, 0x78, 0x79, 0x7A, 0x7B, 0, 0x7C, 0x7D, 0x7E, 0x7F, 0x1D, 0xD, 5,
+    ];
+    let codes_6 = [
+        0, 2, 3, 0xC, 0x1C, 0x3C, 0x7C, 0x7D, 0, 0x7E, 0x7F, 0x3D, 0x1D, 0xD, 4, 5,
+    ];
+
+    let bits_1 = [
+        2, 3, 3, 3, 3, 4, 4, 8, 8, 8, 8, 8, 8, 8, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9,
+        9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9,
+        9, 9, 9, 9,
+    ];
+    let bits_2 = [
+        1, 3, 5, 5, 7, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9,
+        9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 8,
+        7, 5, 5, 3,
+    ];
+    let bits_3 = [
+        2, 3, 3, 5, 5, 7, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9,
+        9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 7, 7,
+        5, 5, 3, 3,
+    ];
+    let bits_4 = [2, 3, 3, 3, 3, 4, 4, 6, 6, 6, 6, 6, 0, 6, 6, 6];
+    let bits_5 = [1, 3, 4, 5, 7, 7, 7, 7, 0, 7, 7, 7, 7, 5, 4, 3];
+    let bits_6 = [2, 3, 3, 4, 5, 6, 7, 7, 0, 7, 7, 6, 5, 4, 3, 3];
+
+    let xlat_1 = [
+        0, 1, 61, 62, 63, 2, 60, 3, 4, 5, 6, 57, 58, 59, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17,
+        18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40,
+        41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56,
+    ];
+    let xlat_2 = [
+        0, 1, 2, 62, 63, 3, 61, 4, 5, 6, 57, 58, 59, 60, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17,
+        18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40,
+        41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56,
+    ];
+    let xlat_4 = [0, 1, 13, 14, 15, 2, 12, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+    let xlat_5 = [0, 1, 2, 14, 15, 3, 13, 4, 5, 6, 7, 9, 8, 10, 11, 12];
+
+    let tab_1 = build_huffman(&codes_1, &bits_1, Some(&xlat_1));
+    let tab_2 = build_huffman(&codes_1, &bits_1, Some(&xlat_2));
+    let tab_3 = build_huffman(&codes_2, &bits_2, None);
+    let tab_4 = build_huffman(&codes_3, &bits_3, None);
+    let tab_5 = build_huffman(&codes_4, &bits_4, Some(&xlat_4));
+    let tab_6 = build_huffman(&codes_4, &bits_4, Some(&xlat_5));
+    let tab_7 = build_huffman(&codes_5, &bits_5, None);
+    let tab_8 = build_huffman(&codes_6, &bits_6, None);
+
+    [tab_1, tab_2, tab_3, tab_4, tab_5, tab_6, tab_7, tab_8]
+});
+pub(crate) static CT_VLC_TABS: LazyLock<[HuffmanTree<i32>; 4]> = LazyLock::new(|| {
+    let codes_1 = [0, 2, 6, 7];
+    let codes_2 = [0, 2, 3, 4, 5, 6, 0xE, 0xF];
+    let codes_3 = [0, 4, 0xA, 0xB, 0xC, 0xD, 0xE, 0xF];
+
+    let bits_1 = [1, 2, 3, 3];
+    let bits_2 = [2, 3, 3, 3, 3, 3, 4, 4];
+    let bits_3 = [1, 3, 4, 4, 4, 4, 4, 4];
+
+    let xlat_1 = [0, 1, 2, 3, 6, 7, 4, 5];
+
+    let tab_1 = build_huffman(&codes_1, &bits_1, None);
+    let tab_2 = build_huffman(&codes_2, &bits_2, None);
+    let tab_3 = build_huffman(&codes_2, &bits_2, Some(&xlat_1));
+    let tab_4 = build_huffman(&codes_3, &bits_3, None);
+
+    [tab_1, tab_2, tab_3, tab_4]
+});
+pub(crate) static GAIN_VLC_TABS: LazyLock<Vec<HuffmanTree<u16>>> = LazyLock::new(|| {
+    let gain_cbs = [
+        &npoints1_cb[..],
+        &npoints1_cb,
+        &lev1_cb,
+        &lev2_cb,
+        &lev3_cb,
+        &lev4_cb,
+        &loc3_cb,
+        &loc1_cb,
+        &loc4_cb,
+        &loc2_cb,
+        &loc5_cb,
+    ];
+
+    let gain_xlats = [
+        None,
+        Some(&npoints2_xlat[..]),
+        Some(&lev1_xlat),
+        Some(&lev2_xlat),
+        Some(&lev3_xlat),
+        Some(&lev4_xlat),
+        Some(&loc3_xlat),
+        Some(&loc1_xlat),
+        Some(&loc4_xlat),
+        Some(&loc2_xlat),
+        Some(&loc5_xlat),
+    ];
+
+    let mut tabs = vec![];
+
+    for i in 0..11 {
+        let tab = build_canonical_huff(gain_cbs[i], gain_xlats[i]);
+        tabs.push(tab);
+    }
+
+    tabs
+});
+pub(crate) static TONE_VLC_TABS: LazyLock<Vec<HuffmanTree<u16>>> = LazyLock::new(|| {
+    let tone_cbs = [
+        &tonebands_cb[..],
+        &numwavs1_cb,
+        &numwavs2_cb,
+        &wav_ampsf1_cb,
+        &wav_ampsf2_cb,
+        &wav_ampsf3_cb,
+        &freq_cb,
+    ];
+
+    let tone_xlats = [
+        None,
+        None,
+        Some(&numwavs2_xlat[..]),
+        Some(&wav_ampsf1_xlat),
+        Some(&wav_ampsf2_xlat),
+        Some(&wav_ampsf3_xlat),
+        Some(&freq_xlat),
+    ];
+
+    let mut tabs = vec![];
+
+    for i in 0..7 {
+        let tab = build_canonical_huff(tone_cbs[i], tone_xlats[i]);
+        tabs.push(tab);
+    }
+
+    tabs
+});
+pub(crate) static SINE_64: LazyLock<[f32; 64]> = LazyLock::new(|| {
+    let mut window = [0.0; 64];
+    sine_window(&mut window, 64);
+    window
+});
+pub(crate) static SINE_128: LazyLock<[f32; 128]> = LazyLock::new(|| {
+    let mut window = [0.0; 128];
+    sine_window(&mut window, 128);
+    window
+});
+pub(crate) static SINE_TABLE: LazyLock<[f32; 2048]> = LazyLock::new(|| {
+    let mut sine_table = [0.0f32; 2048];
+
+    for i in 0..2048 {
+        sine_table[i] = ((std::f32::consts::PI * 2.0) * i as f32 / 2048.0).sin()
+    }
+
+    sine_table
+});
+pub(crate) static HANN_WINDOW: LazyLock<[f32; 256]> = LazyLock::new(|| {
+    let mut hann_window = [0.0f32; 256];
+
+    for i in 0..256 {
+        hann_window[i] = (1.0 - ((std::f32::consts::PI * 2.0) * i as f32 / 256.0).cos()) * 0.5;
+    }
+
+    hann_window
+});
+pub(crate) static AMP_SF_TAB: LazyLock<[f32; 64]> = LazyLock::new(|| {
+    let mut amp_sf_tab = [0.0f32; 64];
+
+    for i in 0..64 {
+        amp_sf_tab[i] = ((i as f32 - 3.0) / 4.0).exp2()
+    }
+
+    amp_sf_tab
+});
 
 fn sine_window(window: &mut [f32], n: usize) {
     for i in 0..n {
@@ -329,16 +388,15 @@ static freq_xlat: [u16; 256] = [
     188, 189, 190, 191, 192, 193,
 ];
 
-fn build_huffman<T: Clone + Copy + std::fmt::Debug + One + Zero + std::ops::AddAssign>(
+fn build_huffman<T: Copy + std::fmt::Debug + One + ToPrimitive + Zero + std::ops::AddAssign>(
     codes: &[T],
     bits: &[u8],
     xlat: Option<&[T]>,
-) -> Box<[ReadHuffmanTree<BigEndian, T>]> {
-    let mut tree = vec![];
+) -> HuffmanTree<T> {
+    let mut tree = HuffmanTree::new();
 
     let mut _idx = T::zero();
     for idx in 0..codes.len() {
-        let code = [codes[idx]];
         let num_bits = bits[idx];
 
         // RESEARCH THIS!!!
@@ -352,24 +410,12 @@ fn build_huffman<T: Clone + Copy + std::fmt::Debug + One + Zero + std::ops::AddA
             _idx
         };
 
-        let slice = unsafe {
-            std::slice::from_raw_parts(code.as_ptr() as *const u8, std::mem::size_of_val(&code))
-        };
-
-        let mut bitreader: BitReader<&[u8], LittleEndian> = BitReader::new(slice);
-        let mut bit_vec = vec![];
-
-        for _ in 0..num_bits {
-            let bit = bitreader.read::<u8>(1).unwrap() as u8;
-            bit_vec.insert(0, bit);
-        }
-
-        tree.push((xlat, bit_vec));
+        tree.insert(codes[idx].to_u64().unwrap(), num_bits, xlat);
 
         _idx += T::one();
     }
 
-    compile_read_tree::<BigEndian, T>(tree).unwrap()
+    tree
 }
 
 pub(crate) static QU_NUM_TO_SEG: [u8; 32] = [
@@ -1702,7 +1748,7 @@ pub(crate) struct SpecCodeTab {
 }
 
 impl SpecCodeTab {
-    fn new(
+    const fn new(
         group_size: u8,
         num_coeffs: u8,
         bits: u8,
@@ -1723,8 +1769,7 @@ impl SpecCodeTab {
     }
 }
 
-lazy_static! {
-    pub(crate) static ref SPECTRA_TABS: [SpecCodeTab; 112] = [
+pub(crate) static SPECTRA_TABS: [SpecCodeTab; 112] = [
     /* table set = A */
     /* code table = 0 */
     SpecCodeTab::new(1, 4, 2, 1, -1, Some(&huff_a01_cb), Some(&huff_a01_xlat)), // wordlen = 1
@@ -1746,7 +1791,7 @@ lazy_static! {
     SpecCodeTab::new(1, 4, 2, 1, -1, Some(&huff_a21_cb), Some(&huff_a21_xlat)), // wordlen = 1
     SpecCodeTab::new(1, 2, 3, 1, -1, Some(&huff_a22_cb), Some(&huff_a22_xlat)), // wordlen = 2
     SpecCodeTab::new(1, 2, 3, 1, -1, Some(&huff_a23_cb), Some(&huff_a23_xlat)), // wordlen = 3
-    SpecCodeTab::new(1, 1, 3, 0, -1, Some(&huff_a24_cb), None), // wordlen = 4
+    SpecCodeTab::new(1, 1, 3, 0, -1, Some(&huff_a24_cb), None),                 // wordlen = 4
     SpecCodeTab::new(1, 1, 3, 0, -1, Some(&huff_a25_cb), Some(&huff_a25_xlat)), // wordlen = 5
     SpecCodeTab::new(1, 2, 4, 0, -1, Some(&huff_a26_cb), Some(&huff_a26_xlat)), // wordlen = 6
     SpecCodeTab::new(1, 1, 6, 1, -1, Some(&huff_a27_cb), Some(&huff_a27_xlat)), // wordlen = 7
@@ -1789,7 +1834,7 @@ lazy_static! {
     SpecCodeTab::new(1, 2, 4, 1, -1, Some(&huff_a74_cb), Some(&huff_a74_xlat)), // wordlen = 4
     SpecCodeTab::new(1, 1, 4, 1, -1, Some(&huff_a75_cb), Some(&huff_a75_xlat)), // wordlen = 5
     SpecCodeTab::new(2, 2, 4, 0, -1, Some(&huff_a76_cb), Some(&huff_a76_xlat)), // wordlen = 6
-    SpecCodeTab::new(4, 1, 6, 1, 6, None, None), // wordlen = 7
+    SpecCodeTab::new(4, 1, 6, 1, 6, None, None),                // wordlen = 7
     /* table set = B */
     /* code table = 0 */
     SpecCodeTab::new(4, 4, 2, 1, -1, Some(&huff_b01_cb), Some(&huff_b01_xlat)), // wordlen = 1
@@ -1797,16 +1842,16 @@ lazy_static! {
     SpecCodeTab::new(4, 2, 3, 1, -1, Some(&huff_b03_cb), Some(&huff_b03_xlat)), // wordlen = 3
     SpecCodeTab::new(1, 2, 4, 1, -1, Some(&huff_b04_cb), Some(&huff_b04_xlat)), // wordlen = 4
     SpecCodeTab::new(1, 2, 4, 1, -1, Some(&huff_b05_cb), Some(&huff_b05_xlat)), // wordlen = 5
-    SpecCodeTab::new(1, 1, 4, 0, 5, None, None), // wordlen = 6
+    SpecCodeTab::new(1, 1, 4, 0, 5, None, None),                                // wordlen = 6
     SpecCodeTab::new(1, 1, 6, 1, -1, Some(&huff_b07_cb), Some(&huff_b07_xlat)), // wordlen = 7
     /* code table = 1 */
     SpecCodeTab::new(1, 4, 2, 1, 14, None, None), // wordlen = 1
     SpecCodeTab::new(1, 4, 2, 0, -1, Some(&huff_b12_cb), Some(&huff_b12_xlat)), // wordlen = 2
-    SpecCodeTab::new(1, 2, 3, 1, 9, None, None), // wordlen = 3
+    SpecCodeTab::new(1, 2, 3, 1, 9, None, None),  // wordlen = 3
     SpecCodeTab::new(1, 2, 4, 1, -1, Some(&huff_b14_cb), Some(&huff_b14_xlat)), // wordlen = 4
     SpecCodeTab::new(1, 2, 4, 1, 11, None, None), // wordlen = 5
     SpecCodeTab::new(1, 2, 4, 0, -1, Some(&huff_b16_cb), Some(&huff_b16_xlat)), // wordlen = 6
-    SpecCodeTab::new(1, 1, 6, 1, 6, None, None), // wordlen = 7
+    SpecCodeTab::new(1, 1, 6, 1, 6, None, None),  // wordlen = 7
     /* code table = 2 */
     SpecCodeTab::new(4, 4, 2, 1, 28, None, None), // wordlen = 1
     SpecCodeTab::new(4, 4, 2, 0, 22, None, None), // wordlen = 2
@@ -1814,7 +1859,7 @@ lazy_static! {
     SpecCodeTab::new(1, 2, 4, 1, 31, None, None), // wordlen = 4
     SpecCodeTab::new(2, 2, 4, 1, 60, None, None), // wordlen = 5
     SpecCodeTab::new(2, 2, 4, 0, -1, Some(&huff_b26_cb), Some(&huff_b26_xlat)), // wordlen = 6
-    SpecCodeTab::new(4, 1, 6, 1, 6, None, None), // wordlen = 7
+    SpecCodeTab::new(4, 1, 6, 1, 6, None, None),  // wordlen = 7
     /* code table = 3 */
     SpecCodeTab::new(1, 4, 2, 1, 35, None, None), // wordlen = 1
     SpecCodeTab::new(1, 4, 2, 0, -1, Some(&huff_b32_cb), Some(&huff_b32_xlat)), // wordlen = 2
@@ -1827,9 +1872,9 @@ lazy_static! {
     SpecCodeTab::new(1, 4, 2, 1, -1, Some(&huff_b41_cb), Some(&huff_b41_xlat)), // wordlen = 1
     SpecCodeTab::new(4, 2, 3, 1, -1, Some(&huff_b42_cb), Some(&huff_b42_xlat)), // wordlen = 2
     SpecCodeTab::new(1, 2, 3, 1, -1, Some(&huff_b43_cb), Some(&huff_b43_xlat)), // wordlen = 3
-    SpecCodeTab::new(4, 2, 4, 1, 66, None, None), // wordlen = 4
-    SpecCodeTab::new(1, 1, 3, 0, 32, None, None), // wordlen = 5
-    SpecCodeTab::new(1, 2, 4, 0, 12, None, None), // wordlen = 6
+    SpecCodeTab::new(4, 2, 4, 1, 66, None, None),                               // wordlen = 4
+    SpecCodeTab::new(1, 1, 3, 0, 32, None, None),                               // wordlen = 5
+    SpecCodeTab::new(1, 2, 4, 0, 12, None, None),                               // wordlen = 6
     SpecCodeTab::new(1, 1, 6, 1, -1, Some(&huff_b47_cb), Some(&huff_b47_xlat)), // wordlen = 7
     /* code table = 5 */
     SpecCodeTab::new(2, 4, 2, 1, 42, None, None), // wordlen = 1
@@ -1849,35 +1894,30 @@ lazy_static! {
     SpecCodeTab::new(1, 1, 6, 1, -1, Some(&huff_b67_cb), Some(&huff_b67_xlat)), // wordlen = 7
     /* code table = 7 */
     SpecCodeTab::new(1, 4, 2, 1, -1, Some(&huff_b71_cb), Some(&huff_b71_xlat)), // wordlen = 1
-    SpecCodeTab::new(4, 4, 2, 0, 78, None, None), // wordlen = 2
+    SpecCodeTab::new(4, 4, 2, 0, 78, None, None),                               // wordlen = 2
     SpecCodeTab::new(4, 4, 2, 0, -1, Some(&huff_b73_cb), Some(&huff_b73_xlat)), // wordlen = 3
     SpecCodeTab::new(1, 1, 4, 1, -1, Some(&huff_b74_cb), Some(&huff_b74_xlat)), // wordlen = 4
     SpecCodeTab::new(1, 2, 4, 1, -1, Some(&huff_b75_cb), Some(&huff_b75_xlat)), // wordlen = 5
-    SpecCodeTab::new(1, 1, 5, 1, 47, None, None), // wordlen = 6
+    SpecCodeTab::new(1, 1, 5, 1, 47, None, None),                               // wordlen = 6
     SpecCodeTab::new(1, 1, 6, 1, -1, Some(&huff_b77_cb), Some(&huff_b77_xlat)), // wordlen = 7
 ];
 
-    pub(crate) static ref SPEC_VLC_TABS: Vec<Option<Box<[ReadHuffmanTree<BigEndian, u16>]>>> = {
-        let mut tabs: Vec<Option<Box<[ReadHuffmanTree<BigEndian, u16>]>>> = vec![];
+pub(crate) static SPEC_VLC_TABS: LazyLock<Vec<Option<HuffmanTree<u16>>>> = LazyLock::new(|| {
+    let mut tabs = vec![];
 
-        for i in 0..SPECTRA_TABS.len() {
-            if let Some(cb) = &SPECTRA_TABS[i].cb {
-                let tab = build_canonical_huff(cb, SPECTRA_TABS[i].xlat);
-                tabs.push(Some(tab));
-            } else {
-                tabs.push(None);
-            }
+    for i in 0..SPECTRA_TABS.len() {
+        if let Some(cb) = &SPECTRA_TABS[i].cb {
+            let tab = build_canonical_huff(cb, SPECTRA_TABS[i].xlat);
+            tabs.push(Some(tab));
+        } else {
+            tabs.push(None);
         }
+    }
 
-        tabs
-    };
+    tabs
+});
 
-}
-
-fn build_canonical_huff(
-    cb: &'static [u16],
-    xlat: Option<&'static [u16]>,
-) -> Box<[ReadHuffmanTree<BigEndian, u16>]> {
+fn build_canonical_huff(cb: &'static [u16], xlat: Option<&'static [u16]>) -> HuffmanTree<u16> {
     let mut codes: [u16; 256] = [0; 256];
     let mut bits: [u8; 256] = [0; 256];
 

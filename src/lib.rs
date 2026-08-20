@@ -7,7 +7,7 @@
 // which is licensed LGPL v2.1. This code therefore is also licensed under the terms
 // of the GNU Lesser General Public License, verison 2.1.
 
-use bitstream_io::{huffman::ReadHuffmanTree, BigEndian, BitReader};
+use bitstream_io::{BigEndian, BitRead, BitReader};
 use riff_wave_reader::RiffWaveReader;
 use rustdct::{
     mdct::{window_fn, MDCTViaDCT4},
@@ -15,6 +15,7 @@ use rustdct::{
 };
 
 use std::io::{Read, Seek, SeekFrom};
+use std::num::{NonZeroU16, NonZeroU32};
 
 mod error;
 pub use error::Error;
@@ -46,8 +47,6 @@ impl<R: Read + Seek> Decoder<R> {
         }
 
         let bit_reader = BitReader::new(riff_reader.into_reader());
-
-        init_static();
 
         let mut context = Context::default();
 
@@ -145,18 +144,18 @@ impl<R: Read + Seek> Iterator for Decoder<R> {
 
 impl<R: Read + Seek> rodio::Source for Decoder<R> {
     #[inline]
-    fn current_frame_len(&self) -> Option<usize> {
-        Some(self.frame.samples.iter().map(|v| v.len()).sum())
+    fn current_span_len(&self) -> Option<usize> {
+        None
     }
 
     #[inline]
-    fn channels(&self) -> u16 {
-        self.spec.channels
+    fn channels(&self) -> rodio::ChannelCount {
+        NonZeroU16::new(self.spec.channels).expect("ATRAC3+ channel count must be non-zero")
     }
 
     #[inline]
-    fn sample_rate(&self) -> u32 {
-        self.spec.sample_rate
+    fn sample_rate(&self) -> rodio::SampleRate {
+        NonZeroU32::new(self.spec.sample_rate).expect("ATRAC3+ sample rate must be non-zero")
     }
 
     #[inline]
@@ -434,7 +433,7 @@ fn decode_frame<'a, R: Read + Seek>(
     ctx.frame_number += 1;
 
     let mut ch_block = 0usize;
-    let mut ch_unit_type = ChannelUnitType::from_bits(bit_reader.read(2)?)?;
+    let mut ch_unit_type = ChannelUnitType::from_bits(bit_reader.read_var(2)?)?;
     while ch_unit_type != ChannelUnitType::Terminator {
         if ch_unit_type == ChannelUnitType::Extension {
             return Err(Error::UnsupportedChannelUnitExtension);
@@ -465,7 +464,7 @@ fn decode_frame<'a, R: Read + Seek>(
         }
 
         ch_block += 1;
-        ch_unit_type = ChannelUnitType::from_bits(bit_reader.read(2)?)?;
+        ch_unit_type = ChannelUnitType::from_bits(bit_reader.read_var(2)?)?;
     }
 
     Ok(())
@@ -476,7 +475,7 @@ fn decode_channel_unit<'a, R: Read + Seek>(
     mut channel_unit: &'a mut ChannelUnit,
     num_channels: usize,
 ) -> Result<(), Error> {
-    channel_unit.num_quant_units = bit_reader.read::<i32>(5)? + 1;
+    channel_unit.num_quant_units = bit_reader.read_unsigned_var::<u32>(5)? as i32 + 1;
 
     if channel_unit.num_quant_units > 28 && channel_unit.num_quant_units < 32 {
         return Err(Error::OtherFormat(format!(
@@ -485,7 +484,7 @@ fn decode_channel_unit<'a, R: Read + Seek>(
         )));
     }
 
-    channel_unit.mute_flag = bit_reader.read::<i32>(1)?;
+    channel_unit.mute_flag = bit_reader.read_unsigned_var::<u32>(1)? as i32;
 
     decode_quant_wordlen(bit_reader, &mut channel_unit, num_channels)?;
 
@@ -522,10 +521,10 @@ fn decode_channel_unit<'a, R: Read + Seek>(
 
     decode_tones_info(bit_reader, &mut channel_unit, num_channels)?;
 
-    channel_unit.noise_present = bit_reader.read::<i32>(1)?;
+    channel_unit.noise_present = bit_reader.read_unsigned_var::<u32>(1)? as i32;
     if channel_unit.noise_present > 0 {
-        channel_unit.noise_level_index = bit_reader.read::<i32>(4)?;
-        channel_unit.noise_table_index = bit_reader.read::<i32>(4)?;
+        channel_unit.noise_level_index = bit_reader.read_unsigned_var::<u32>(4)? as i32;
+        channel_unit.noise_table_index = bit_reader.read_unsigned_var::<u32>(4)? as i32;
     }
 
     Ok(())
@@ -568,13 +567,13 @@ fn decode_channel_wordlen<'a, R: Read + Seek>(
 
     channel_unit.channels[ch_num].fill_mode = 0;
 
-    let coding_mode = bit_reader.read::<u8>(2)?;
+    let coding_mode = bit_reader.read_var::<u8>(2)?;
     match coding_mode {
         0 => {
             for i in 0..channel_unit.num_quant_units {
                 let mut chan = &mut channel_unit.channels[ch_num];
 
-                chan.qu_wordlen[i as usize] = bit_reader.read::<i32>(3)?;
+                chan.qu_wordlen[i as usize] = bit_reader.read_unsigned_var::<u32>(3)? as i32;
             }
         }
         1 => {
@@ -585,38 +584,39 @@ fn decode_channel_wordlen<'a, R: Read + Seek>(
                 let mut chan = &mut channel_unit.channels[ch_num];
 
                 if chan.num_coded_vals > 0 {
-                    let vlc_sel = bit_reader.read::<u8>(2)? as usize;
+                    let vlc_sel = bit_reader.read_var::<u8>(2)? as usize;
                     let vlc_tab = &WL_VLC_TABS[vlc_sel];
 
                     for i in 0..chan.num_coded_vals as usize {
-                        let delta = bit_reader.read_huffman(&vlc_tab)?;
+                        let delta = vlc_tab.read(bit_reader)?;
                         chan.qu_wordlen[i] = (ref_chan.qu_wordlen[i] + delta) & 7;
                     }
                 }
             } else {
-                weight_index = Some(bit_reader.read::<u8>(2)?);
+                weight_index = Some(bit_reader.read_var::<u8>(2)?);
 
                 num_coded_units(bit_reader, ch_num, channel_unit)?;
 
                 let mut chan = &mut channel_unit.channels[ch_num];
 
                 if chan.num_coded_vals > 0 {
-                    let pos = bit_reader.read::<i32>(5)?;
+                    let pos = bit_reader.read_unsigned_var::<u32>(5)? as i32;
 
                     if pos > chan.num_coded_vals {
                         return Err(Error::Other("WL mode 1: invalid position!"));
                     }
 
-                    let delta_bits = bit_reader.read::<u8>(2)?;
-                    let min_value = bit_reader.read::<u16>(3)?;
+                    let delta_bits = bit_reader.read_var::<u8>(2)?;
+                    let min_value = bit_reader.read_var::<u16>(3)?;
 
                     for i in 0..pos as usize {
-                        chan.qu_wordlen[i] = bit_reader.read::<i32>(3)?;
+                        chan.qu_wordlen[i] = bit_reader.read_unsigned_var::<u32>(3)? as i32;
                     }
 
                     for i in pos..chan.num_coded_vals {
-                        chan.qu_wordlen[i as usize] =
-                            (min_value as i32 + bit_reader.read::<i32>(delta_bits as _)?) & 7;
+                        chan.qu_wordlen[i as usize] = (min_value as i32
+                            + bit_reader.read_unsigned_var::<u32>(delta_bits as _)? as i32)
+                            & 7;
                     }
                 }
             }
@@ -628,30 +628,30 @@ fn decode_channel_wordlen<'a, R: Read + Seek>(
             let mut chan = &mut channel_unit.channels[ch_num];
 
             if ch_num > 0 && chan.num_coded_vals > 0 {
-                let vlc_tab = &WL_VLC_TABS[bit_reader.read::<u8>(2)? as usize];
-                let delta = bit_reader.read_huffman(&vlc_tab)?;
+                let vlc_tab = &WL_VLC_TABS[bit_reader.read_var::<u8>(2)? as usize];
+                let delta = vlc_tab.read(bit_reader)?;
                 chan.qu_wordlen[0] = (ref_chan.qu_wordlen[0] + delta) & 7;
 
                 for i in 1..chan.num_coded_vals as usize {
                     let diff = ref_chan.qu_wordlen[i] - ref_chan.qu_wordlen[i - 1];
-                    let delta = bit_reader.read_huffman(&vlc_tab)?;
+                    let delta = vlc_tab.read(bit_reader)?;
                     chan.qu_wordlen[i] = (chan.qu_wordlen[i - 1] + diff + delta) & 7;
                 }
             } else if chan.num_coded_vals > 0 {
                 let flag = bit_reader.read_bit()?;
-                let vlc_tab = &WL_VLC_TABS[bit_reader.read::<u8>(1)? as usize];
+                let vlc_tab = &WL_VLC_TABS[bit_reader.read_var::<u8>(1)? as usize];
 
-                let start_val = bit_reader.read::<u8>(3)?;
+                let start_val = bit_reader.read_var::<u8>(3)?;
                 unpack_vq_shape(
                     start_val,
-                    &WL_SHAPES[start_val as usize][bit_reader.read::<u8>(4)? as usize],
+                    &WL_SHAPES[start_val as usize][bit_reader.read_var::<u8>(4)? as usize],
                     &mut chan.qu_wordlen,
                     chan.num_coded_vals as _,
                 );
 
                 if !flag {
                     for i in 0..chan.num_coded_vals as usize {
-                        let delta = bit_reader.read_huffman(&vlc_tab)?;
+                        let delta = vlc_tab.read(bit_reader)?;
                         chan.qu_wordlen[i] = (chan.qu_wordlen[i] + delta) & 7;
                     }
                 } else {
@@ -659,11 +659,11 @@ fn decode_channel_wordlen<'a, R: Read + Seek>(
                     while i < (chan.num_coded_vals as isize & -2) as usize {
                         if !bit_reader.read_bit()? {
                             chan.qu_wordlen[i as usize] = (chan.qu_wordlen[i as usize]
-                                + bit_reader.read_huffman(&vlc_tab)? as i32)
+                                + vlc_tab.read(bit_reader)? as i32)
                                 & 7;
 
                             chan.qu_wordlen[i as usize + 1] = (chan.qu_wordlen[i as usize + 1]
-                                + bit_reader.read_huffman(&vlc_tab)? as i32)
+                                + vlc_tab.read(bit_reader)? as i32)
                                 & 7;
                         }
 
@@ -671,27 +671,26 @@ fn decode_channel_wordlen<'a, R: Read + Seek>(
                     }
 
                     if chan.num_coded_vals & 1 > 0 {
-                        chan.qu_wordlen[i as usize] = (chan.qu_wordlen[i as usize]
-                            + bit_reader.read_huffman(&vlc_tab)? as i32)
-                            & 7;
+                        chan.qu_wordlen[i as usize] =
+                            (chan.qu_wordlen[i as usize] + vlc_tab.read(bit_reader)? as i32) & 7;
                     }
                 }
             }
         }
         3 => {
-            weight_index = Some(bit_reader.read::<u8>(2)?);
+            weight_index = Some(bit_reader.read_var::<u8>(2)?);
 
             num_coded_units(bit_reader, ch_num, channel_unit)?;
 
             let mut chan = &mut channel_unit.channels[ch_num];
 
             if chan.num_coded_vals > 0 {
-                let vlc_tab = &WL_VLC_TABS[bit_reader.read::<u8>(2)? as usize];
+                let vlc_tab = &WL_VLC_TABS[bit_reader.read_var::<u8>(2)? as usize];
 
-                chan.qu_wordlen[0] = bit_reader.read::<i32>(3)?;
+                chan.qu_wordlen[0] = bit_reader.read_unsigned_var::<u32>(3)? as i32;
 
                 for i in 1..chan.num_coded_vals as usize {
-                    let delta = bit_reader.read_huffman(&vlc_tab)?;
+                    let delta = vlc_tab.read(bit_reader)?;
                     chan.qu_wordlen[i] = (chan.qu_wordlen[i - 1] + delta) & 7;
                 }
             }
@@ -705,7 +704,7 @@ fn decode_channel_wordlen<'a, R: Read + Seek>(
         if chan.fill_mode == 2 {
             for i in chan.num_coded_vals..channel_unit.num_quant_units {
                 chan.qu_wordlen[i as usize] = if ch_num > 0 {
-                    bit_reader.read::<i32>(1)?
+                    bit_reader.read_unsigned_var::<u32>(1)? as i32
                 } else {
                     1
                 }
@@ -743,19 +742,19 @@ fn num_coded_units<'a, R: Read + Seek>(
 ) -> Result<(), Error> {
     let mut chan = &mut channel_unit.channels[ch_num];
 
-    chan.fill_mode = bit_reader.read::<i32>(2)?;
+    chan.fill_mode = bit_reader.read_unsigned_var::<u32>(2)? as i32;
 
     if !(chan.fill_mode > 0) {
         chan.num_coded_vals = channel_unit.num_quant_units;
     } else {
-        chan.num_coded_vals = bit_reader.read::<i32>(5)?;
+        chan.num_coded_vals = bit_reader.read_unsigned_var::<u32>(5)? as i32;
 
         if chan.num_coded_vals > channel_unit.num_quant_units {
             return Err(Error::Other("Invalid number of transmitted units!"));
         }
 
         if chan.fill_mode == 3 {
-            let bits = bit_reader.read::<i32>(2)?;
+            let bits = bit_reader.read_unsigned_var::<u32>(2)? as i32;
             chan.split_point = bits + (chan.ch_num << 1) + 1;
         }
     }
@@ -825,58 +824,60 @@ fn decode_channel_sf_idx<'a, R: Read + Seek>(
 ) -> Result<(), Error> {
     let mut weight_index: Option<u8> = None;
 
-    let coding_mode = bit_reader.read::<u8>(2)?;
+    let coding_mode = bit_reader.read_var::<u8>(2)?;
     match coding_mode {
         0 => {
             let mut chan = &mut channel_unit.channels[ch_num];
 
             for i in 0..channel_unit.used_quant_units as usize {
-                chan.qu_sf_idx[i] = bit_reader.read::<i32>(6)?;
+                chan.qu_sf_idx[i] = bit_reader.read_unsigned_var::<u32>(6)? as i32;
             }
         }
         1 => {
             if ch_num > 0 {
-                let vlc_tab = &SF_VLC_TABS[bit_reader.read::<u8>(2)? as usize];
+                let vlc_tab = &SF_VLC_TABS[bit_reader.read_var::<u8>(2)? as usize];
 
                 let ref_chan = channel_unit.channels[0];
                 let mut chan = &mut channel_unit.channels[ch_num];
 
                 for i in 0..channel_unit.used_quant_units as usize {
-                    let delta = bit_reader.read_huffman(&vlc_tab)?;
+                    let delta = vlc_tab.read(bit_reader)?;
                     chan.qu_sf_idx[i] = (ref_chan.qu_sf_idx[i] + delta) & 0x3F;
                 }
             } else {
-                weight_index = Some(bit_reader.read::<u8>(2)?);
+                weight_index = Some(bit_reader.read_var::<u8>(2)?);
                 if weight_index.unwrap() == 3 {
                     let mut chan = &mut channel_unit.channels[ch_num];
 
-                    let start_val = bit_reader.read::<u8>(6)?;
+                    let start_val = bit_reader.read_var::<u8>(6)?;
                     unpack_vq_shape(
                         start_val,
-                        &SF_SHAPES[bit_reader.read::<u8>(6)? as usize],
+                        &SF_SHAPES[bit_reader.read_var::<u8>(6)? as usize],
                         &mut chan.qu_sf_idx,
                         channel_unit.used_quant_units as usize,
                     );
 
-                    let num_long_vals = bit_reader.read::<i32>(5)?;
-                    let delta_bits = bit_reader.read::<u8>(2)?;
-                    let min_val = bit_reader.read::<i32>(4)? - 7;
+                    let num_long_vals = bit_reader.read_unsigned_var::<u32>(5)? as i32;
+                    let delta_bits = bit_reader.read_var::<u8>(2)?;
+                    let min_val = bit_reader.read_unsigned_var::<u32>(4)? as i32 - 7;
 
                     for i in 0..num_long_vals as usize {
-                        chan.qu_sf_idx[i] =
-                            (chan.qu_sf_idx[i] + bit_reader.read::<i32>(4)? - 7) & 0x3F;
+                        chan.qu_sf_idx[i] = (chan.qu_sf_idx[i]
+                            + bit_reader.read_unsigned_var::<u32>(4)? as i32
+                            - 7)
+                            & 0x3F;
                     }
 
                     for i in num_long_vals..channel_unit.used_quant_units {
                         chan.qu_sf_idx[i as usize] = (chan.qu_sf_idx[i as usize]
                             + min_val
-                            + bit_reader.read::<i32>(delta_bits as _)?)
+                            + bit_reader.read_unsigned_var::<u32>(delta_bits as _)? as i32)
                             & 0x3F;
                     }
                 } else {
-                    let num_long_vals = bit_reader.read::<i32>(5)?;
-                    let delta_bits = bit_reader.read::<u32>(3)?;
-                    let min_val = bit_reader.read::<i32>(6)?;
+                    let num_long_vals = bit_reader.read_unsigned_var::<u32>(5)? as i32;
+                    let delta_bits = bit_reader.read_var::<u32>(3)?;
+                    let min_val = bit_reader.read_unsigned_var::<u32>(6)? as i32;
 
                     if num_long_vals > channel_unit.used_quant_units || delta_bits == 7 {
                         return Err(Error::Other("SF mode 1: invalid parameters!"));
@@ -885,46 +886,47 @@ fn decode_channel_sf_idx<'a, R: Read + Seek>(
                     let mut chan = &mut channel_unit.channels[ch_num];
 
                     for i in 0..num_long_vals as usize {
-                        chan.qu_sf_idx[i] = bit_reader.read::<i32>(6)?;
+                        chan.qu_sf_idx[i] = bit_reader.read_unsigned_var::<u32>(6)? as i32;
                     }
 
                     for i in num_long_vals..channel_unit.used_quant_units {
-                        chan.qu_sf_idx[i as usize] =
-                            (min_val + bit_reader.read::<i32>(delta_bits)?) & 0x3F;
+                        chan.qu_sf_idx[i as usize] = (min_val
+                            + bit_reader.read_unsigned_var::<u32>(delta_bits)? as i32)
+                            & 0x3F;
                     }
                 }
             }
         }
         2 => {
             if ch_num > 0 {
-                let vlc_tab = &SF_VLC_TABS[bit_reader.read::<u8>(2)? as usize];
+                let vlc_tab = &SF_VLC_TABS[bit_reader.read_var::<u8>(2)? as usize];
 
                 let ref_chan = channel_unit.channels[0];
                 let mut chan = &mut channel_unit.channels[ch_num];
 
-                let mut delta = bit_reader.read_huffman(&vlc_tab)?;
+                let mut delta = vlc_tab.read(bit_reader)?;
                 chan.qu_sf_idx[0] = (ref_chan.qu_sf_idx[0] + delta) & 0x3F;
 
                 for i in 1..channel_unit.used_quant_units as usize {
                     let diff = ref_chan.qu_sf_idx[i] - ref_chan.qu_sf_idx[i - 1];
-                    delta = bit_reader.read_huffman(&vlc_tab)?;
+                    delta = vlc_tab.read(bit_reader)?;
                     chan.qu_sf_idx[i] = (chan.qu_sf_idx[i - 1] + diff + delta) & 0x3F;
                 }
             } else {
-                let vlc_tab = &SF_VLC_TABS[bit_reader.read::<u8>(2)? as usize + 4];
+                let vlc_tab = &SF_VLC_TABS[bit_reader.read_var::<u8>(2)? as usize + 4];
 
                 let mut chan = &mut channel_unit.channels[ch_num];
 
-                let start_val = bit_reader.read::<u8>(6)?;
+                let start_val = bit_reader.read_var::<u8>(6)?;
                 unpack_vq_shape(
                     start_val,
-                    &SF_SHAPES[bit_reader.read::<u8>(6)? as usize],
+                    &SF_SHAPES[bit_reader.read_var::<u8>(6)? as usize],
                     &mut chan.qu_sf_idx,
                     channel_unit.used_quant_units as usize,
                 );
 
                 for i in 0..channel_unit.used_quant_units as usize {
-                    let delta = bit_reader.read_huffman::<i32>(&vlc_tab)?;
+                    let delta = vlc_tab.read(bit_reader)?;
                     chan.qu_sf_idx[i] = (chan.qu_sf_idx[i] + sign_extend(delta, 4)) & 0x3F;
                 }
             }
@@ -940,34 +942,34 @@ fn decode_channel_sf_idx<'a, R: Read + Seek>(
             } else {
                 let mut chan = &mut channel_unit.channels[ch_num];
 
-                weight_index = Some(bit_reader.read::<u8>(2)?);
-                let vlc_sel = bit_reader.read::<u8>(2)? as usize;
+                weight_index = Some(bit_reader.read_var::<u8>(2)?);
+                let vlc_sel = bit_reader.read_var::<u8>(2)? as usize;
                 let mut vlc_tab = &SF_VLC_TABS[vlc_sel];
 
                 if weight_index.unwrap() == 3 {
                     vlc_tab = &SF_VLC_TABS[vlc_sel + 4];
 
-                    let start_val = bit_reader.read::<u8>(6)?;
+                    let start_val = bit_reader.read_var::<u8>(6)?;
                     unpack_vq_shape(
                         start_val,
-                        &SF_SHAPES[bit_reader.read::<u8>(6)? as usize],
+                        &SF_SHAPES[bit_reader.read_var::<u8>(6)? as usize],
                         &mut chan.qu_sf_idx,
                         channel_unit.used_quant_units as usize,
                     );
 
-                    let mut diff = (bit_reader.read::<i32>(4)? + 56) & 0x3F;
+                    let mut diff = (bit_reader.read_unsigned_var::<u32>(4)? as i32 + 56) & 0x3F;
                     chan.qu_sf_idx[0] = (chan.qu_sf_idx[0] + diff) & 0x3F;
 
                     for i in 1..channel_unit.used_quant_units {
-                        let delta = bit_reader.read_huffman(&vlc_tab)?;
+                        let delta = vlc_tab.read(bit_reader)?;
                         diff = (diff + sign_extend(delta, 4)) & 0x3F;
                         chan.qu_sf_idx[i as usize] = (diff + chan.qu_sf_idx[i as usize]) & 0x3F;
                     }
                 } else {
-                    chan.qu_sf_idx[0] = bit_reader.read::<i32>(6)?;
+                    chan.qu_sf_idx[0] = bit_reader.read_unsigned_var::<u32>(6)? as i32;
 
                     for i in 1..channel_unit.used_quant_units {
-                        let delta = bit_reader.read_huffman(&vlc_tab)?;
+                        let delta = vlc_tab.read(bit_reader)?;
                         chan.qu_sf_idx[i as usize] =
                             (chan.qu_sf_idx[i as usize - 1] + delta) & 0x3F;
                     }
@@ -1018,7 +1020,7 @@ fn decode_code_table_indexes<'a, R: Read + Seek>(
         return Ok(());
     }
 
-    channel_unit.use_full_table = bit_reader.read::<i32>(1)?;
+    channel_unit.use_full_table = bit_reader.read_unsigned_var::<u32>(1)? as i32;
 
     for ch_num in 0..num_channels {
         for i in 0..channel_unit.channels[ch_num].qu_tab_idx.len() {
@@ -1046,10 +1048,10 @@ fn decode_channel_code_tab<'a, R: Read + Seek>(
 
     {
         let mut chan = &mut channel_unit.channels[ch_num];
-        chan.table_type = bit_reader.read::<i32>(1)?;
+        chan.table_type = bit_reader.read_unsigned_var::<u32>(1)? as i32;
     }
 
-    let coding_mode = bit_reader.read::<i32>(2)?;
+    let coding_mode = bit_reader.read_unsigned_var::<u32>(2)? as i32;
     match coding_mode {
         0 => {
             let num_bits = channel_unit.use_full_table as u32 + 2;
@@ -1111,7 +1113,7 @@ fn get_subband_flags<'a, R: Read + Seek>(
     if result {
         if bit_reader.read_bit()? {
             for i in 0..num_flags {
-                out[i] = bit_reader.read::<u8>(1)?;
+                out[i] = bit_reader.read_var::<u8>(1)?;
             }
         } else {
             for i in 0..num_flags {
@@ -1128,14 +1130,14 @@ enum CodeTabOperation<'a> {
         num_bits: u32,
     },
     Vlc {
-        vlc_tab: &'a [ReadHuffmanTree<BigEndian, i32>],
+        vlc_tab: &'a HuffmanTree<i32>,
     },
     VlcDelta {
-        vlc_tab: &'a [ReadHuffmanTree<BigEndian, i32>],
-        delta_vlc_tab: &'a [ReadHuffmanTree<BigEndian, i32>],
+        vlc_tab: &'a HuffmanTree<i32>,
+        delta_vlc_tab: &'a HuffmanTree<i32>,
     },
     VlcDiff {
-        vlc_tab: &'a [ReadHuffmanTree<BigEndian, i32>],
+        vlc_tab: &'a HuffmanTree<i32>,
     },
 }
 
@@ -1149,21 +1151,23 @@ impl<'a> CodeTabOperation<'a> {
         pred: &'a mut i32,
     ) -> Result<i32, Error> {
         match self {
-            CodeTabOperation::Direct { num_bits } => Ok(bit_reader.read::<i32>(*num_bits)?),
-            CodeTabOperation::Vlc { vlc_tab } => Ok(bit_reader.read_huffman(vlc_tab)?),
+            CodeTabOperation::Direct { num_bits } => {
+                Ok(bit_reader.read_unsigned_var::<u32>(*num_bits)? as i32)
+            }
+            CodeTabOperation::Vlc { vlc_tab } => Ok(vlc_tab.read(bit_reader)?),
             CodeTabOperation::VlcDelta {
                 vlc_tab,
                 delta_vlc_tab,
             } => {
                 *pred = if !(i > 0) {
-                    bit_reader.read_huffman(vlc_tab)?
+                    vlc_tab.read(bit_reader)?
                 } else {
-                    (*pred + bit_reader.read_huffman(delta_vlc_tab)?) & mask
+                    (*pred + delta_vlc_tab.read(bit_reader)?) & mask
                 };
                 Ok(*pred)
             }
             CodeTabOperation::VlcDiff { vlc_tab } => {
-                Ok((ref_chan.qu_tab_idx[i] + bit_reader.read_huffman(vlc_tab)?) & mask)
+                Ok((ref_chan.qu_tab_idx[i] + vlc_tab.read(bit_reader)?) & mask)
             }
         }
     }
@@ -1186,7 +1190,7 @@ fn dec_ct_idx_common<'a, R: Read + Seek>(
         if chan.qu_wordlen[i] > 0 {
             chan.qu_tab_idx[i] = operation.get_idx(bit_reader, ref_chan, i, mask, &mut pred)?;
         } else if ch_num > 0 && ref_chan.qu_wordlen[i] > 0 {
-            chan.qu_tab_idx[i] = bit_reader.read::<i32>(1)?;
+            chan.qu_tab_idx[i] = bit_reader.read_unsigned_var::<u32>(1)? as i32;
         }
     }
 
@@ -1198,7 +1202,7 @@ fn get_num_ct_values<'a, R: Read + Seek>(
     channel_unit: &'a mut ChannelUnit,
 ) -> Result<i32, Error> {
     if bit_reader.read_bit()? {
-        let num_coded_vals = bit_reader.read::<i32>(5)?;
+        let num_coded_vals = bit_reader.read_unsigned_var::<u32>(5)? as i32;
         if num_coded_vals > channel_unit.used_quant_units {
             return Err(Error::OtherFormat(format!(
                 "Invalid number of code table indexes: {}!",
@@ -1287,7 +1291,7 @@ fn decode_spectrum<'a, R: Read + Seek>(
 
             num_specs = SUBBAND_TO_NUM_POWGRPS[channel_unit.num_coded_subbands as usize - 1] as u16;
             for i in 0..num_specs as usize {
-                chan.power_levs[i] = bit_reader.read::<u8>(4)?;
+                chan.power_levs[i] = bit_reader.read_var::<u8>(4)?;
             }
         }
     }
@@ -1298,7 +1302,7 @@ fn decode_spectrum<'a, R: Read + Seek>(
 fn decode_qu_spectra<'a, R: Read + Seek>(
     bit_reader: &'a mut BitReader<R, BigEndian>,
     tab: &'a SpecCodeTab,
-    vlc_tab: &'a Option<Box<[ReadHuffmanTree<BigEndian, u16>]>>,
+    vlc_tab: &'a Option<HuffmanTree<u16>>,
     out: &'a mut [i16],
     num_specs: usize,
 ) -> Result<(), Error> {
@@ -1313,7 +1317,7 @@ fn decode_qu_spectra<'a, R: Read + Seek>(
             for _ in 0..group_size {
                 // NEED TO RESEARCH, NULL VLC_TAB
                 let mut val = if let Some(tab) = vlc_tab {
-                    bit_reader.read_huffman(tab)?
+                    tab.read(bit_reader)?
                 } else {
                     0
                 } as i32;
@@ -1368,10 +1372,11 @@ fn decode_gainc_data<'a, R: Read + Seek>(
         }
 
         if bit_reader.read_bit()? {
-            let coded_subbands = bit_reader.read::<i32>(4)? + 1;
+            let coded_subbands = bit_reader.read_unsigned_var::<u32>(4)? as i32 + 1;
 
             if bit_reader.read_bit()? {
-                channel_unit.channels[ch_num].num_gain_subbands = bit_reader.read::<i32>(4)? + 1;
+                channel_unit.channels[ch_num].num_gain_subbands =
+                    bit_reader.read_unsigned_var::<u32>(4)? as i32 + 1;
             } else {
                 channel_unit.channels[ch_num].num_gain_subbands = coded_subbands;
             }
@@ -1403,34 +1408,34 @@ fn decode_gainc_npoints<'a, R: Read + Seek>(
     let ref_chan = channel_unit.channels[0];
     let mut chan = &mut channel_unit.channels[ch_num];
 
-    let coding_mode = bit_reader.read::<u8>(2)?;
+    let coding_mode = bit_reader.read_var::<u8>(2)?;
     match coding_mode {
         0 => {
             for i in 0..coded_subbands {
-                chan.gain_data[i].num_points = bit_reader.read::<i32>(3)?;
+                chan.gain_data[i].num_points = bit_reader.read_unsigned_var::<u32>(3)? as i32;
             }
         }
         1 => {
             for i in 0..coded_subbands {
                 let vlc_tab = &GAIN_VLC_TABS[0];
-                chan.gain_data[i].num_points = bit_reader.read_huffman(&vlc_tab)? as i32;
+                chan.gain_data[i].num_points = vlc_tab.read(bit_reader)? as i32;
             }
         }
         2 => {
             if ch_num > 0 {
                 for i in 0..coded_subbands {
                     let vlc_tab = &GAIN_VLC_TABS[1];
-                    let delta = bit_reader.read_huffman(&vlc_tab)? as i32;
+                    let delta = vlc_tab.read(bit_reader)? as i32;
 
                     chan.gain_data[i].num_points = (ref_chan.gain_data[i].num_points + delta) & 7;
                 }
             } else {
                 let vlc_tab = &GAIN_VLC_TABS[0];
-                chan.gain_data[0].num_points = bit_reader.read_huffman(&vlc_tab)? as i32;
+                chan.gain_data[0].num_points = vlc_tab.read(bit_reader)? as i32;
 
                 for i in 1..coded_subbands {
                     let vlc_tab = &GAIN_VLC_TABS[1];
-                    let delta = bit_reader.read_huffman(&vlc_tab)? as i32;
+                    let delta = vlc_tab.read(bit_reader)? as i32;
 
                     chan.gain_data[i].num_points = (chan.gain_data[i - 1].num_points + delta) & 7;
                 }
@@ -1442,11 +1447,12 @@ fn decode_gainc_npoints<'a, R: Read + Seek>(
                     chan.gain_data[i].num_points = ref_chan.gain_data[i].num_points;
                 }
             } else {
-                let delta_bits = bit_reader.read::<u32>(2)?;
-                let min_val = bit_reader.read::<i32>(3)?;
+                let delta_bits = bit_reader.read_var::<u32>(2)?;
+                let min_val = bit_reader.read_unsigned_var::<u32>(3)? as i32;
 
                 for i in 0..coded_subbands {
-                    chan.gain_data[i].num_points = min_val + bit_reader.read::<i32>(delta_bits)?;
+                    chan.gain_data[i].num_points =
+                        min_val + bit_reader.read_unsigned_var::<u32>(delta_bits)? as i32;
 
                     if chan.gain_data[i].num_points > 7 {
                         return Err(Error::InvalidData);
@@ -1469,12 +1475,12 @@ fn decode_gainc_levels<'a, R: Read + Seek>(
     let ref_chan = channel_unit.channels[0];
     let mut chan = &mut channel_unit.channels[ch_num];
 
-    let coding_mode = bit_reader.read::<u8>(2)?;
+    let coding_mode = bit_reader.read_var::<u8>(2)?;
     match coding_mode {
         0 => {
             for sb in 0..coded_subbands {
                 for i in 0..chan.gain_data[sb].num_points as usize {
-                    chan.gain_data[sb].lev_code[i] = bit_reader.read::<i32>(4)?;
+                    chan.gain_data[sb].lev_code[i] = bit_reader.read_unsigned_var::<u32>(4)? as i32;
                 }
             }
         }
@@ -1483,7 +1489,7 @@ fn decode_gainc_levels<'a, R: Read + Seek>(
                 for sb in 0..coded_subbands {
                     for i in 0..chan.gain_data[sb].num_points as usize {
                         let vlc_tab = &GAIN_VLC_TABS[5];
-                        let delta = bit_reader.read_huffman(vlc_tab)?;
+                        let delta = vlc_tab.read(bit_reader)?;
 
                         let pred = if i >= ref_chan.gain_data[sb].num_points as usize {
                             7
@@ -1502,12 +1508,12 @@ fn decode_gainc_levels<'a, R: Read + Seek>(
 
                         if dst.num_points > 0 {
                             let vlc_tab = &GAIN_VLC_TABS[2];
-                            dst.lev_code[0] = bit_reader.read_huffman(vlc_tab)? as i32;
+                            dst.lev_code[0] = vlc_tab.read(bit_reader)? as i32;
                         }
 
                         for i in 1..dst.num_points as usize {
                             let vlc_tab = &GAIN_VLC_TABS[3];
-                            let delta = bit_reader.read_huffman(vlc_tab)? as i32;
+                            let delta = vlc_tab.read(bit_reader)? as i32;
 
                             dst.lev_code[i] = (dst.lev_code[i - 1] + delta) & 0xF;
                         }
@@ -1526,12 +1532,12 @@ fn decode_gainc_levels<'a, R: Read + Seek>(
 
                                 if dst.num_points > 0 {
                                     let vlc_tab = &GAIN_VLC_TABS[2];
-                                    dst.lev_code[0] = bit_reader.read_huffman(vlc_tab)? as i32;
+                                    dst.lev_code[0] = vlc_tab.read(bit_reader)? as i32;
                                 }
 
                                 for i in 1..dst.num_points as usize {
                                     let vlc_tab = &GAIN_VLC_TABS[3];
-                                    let delta = bit_reader.read_huffman(vlc_tab)? as i32;
+                                    let delta = vlc_tab.read(bit_reader)? as i32;
 
                                     dst.lev_code[i] = (dst.lev_code[i - 1] + delta) & 0xF;
                                 }
@@ -1561,12 +1567,12 @@ fn decode_gainc_levels<'a, R: Read + Seek>(
 
                         if dst.num_points > 0 {
                             let vlc_tab = &GAIN_VLC_TABS[2];
-                            dst.lev_code[0] = bit_reader.read_huffman(vlc_tab)? as i32;
+                            dst.lev_code[0] = vlc_tab.read(bit_reader)? as i32;
                         }
 
                         for i in 1..dst.num_points as usize {
                             let vlc_tab = &GAIN_VLC_TABS[3];
-                            let delta = bit_reader.read_huffman(vlc_tab)? as i32;
+                            let delta = vlc_tab.read(bit_reader)? as i32;
 
                             dst.lev_code[i] = (dst.lev_code[i - 1] + delta) & 0xF;
                         }
@@ -1576,7 +1582,7 @@ fn decode_gainc_levels<'a, R: Read + Seek>(
                 for sb in 1..coded_subbands {
                     for i in 0..chan.gain_data[sb].num_points as usize {
                         let vlc_tab = &GAIN_VLC_TABS[4];
-                        let delta = bit_reader.read_huffman(vlc_tab)? as i32;
+                        let delta = vlc_tab.read(bit_reader)? as i32;
 
                         let pred = if i >= chan.gain_data[sb - 1].num_points as usize {
                             7
@@ -1607,13 +1613,13 @@ fn decode_gainc_levels<'a, R: Read + Seek>(
                     }
                 }
             } else {
-                let delta_bits = bit_reader.read::<u32>(2)?;
-                let min_val = bit_reader.read::<i32>(4)?;
+                let delta_bits = bit_reader.read_var::<u32>(2)?;
+                let min_val = bit_reader.read_unsigned_var::<u32>(4)? as i32;
 
                 for sb in 0..coded_subbands {
                     for i in 0..chan.gain_data[sb].num_points as usize {
                         chan.gain_data[sb].lev_code[i] =
-                            min_val + bit_reader.read::<i32>(delta_bits)?;
+                            min_val + bit_reader.read_unsigned_var::<u32>(delta_bits)? as i32;
 
                         if chan.gain_data[sb].lev_code[i] > 15 {
                             return Err(Error::InvalidData);
@@ -1637,7 +1643,7 @@ fn decode_gainc_loc_codes<'a, R: Read + Seek>(
     let ref_chan = channel_unit.channels[0];
     let mut chan = &mut channel_unit.channels[ch_num];
 
-    let coding_mode = bit_reader.read::<u8>(2)?;
+    let coding_mode = bit_reader.read_var::<u8>(2)?;
     match coding_mode {
         0 => {
             for sb in 0..coded_subbands {
@@ -1648,13 +1654,13 @@ fn decode_gainc_loc_codes<'a, R: Read + Seek>(
                         let pos = i;
 
                         if !(pos > 0) || dst.loc_code[pos - 1] < 15 {
-                            dst.loc_code[pos] = bit_reader.read::<i32>(5)?;
+                            dst.loc_code[pos] = bit_reader.read_unsigned_var::<u32>(5)? as i32;
                         } else if dst.loc_code[pos - 1] >= 30 {
                             dst.loc_code[pos] = 31;
                         } else {
                             let delta_bits = log2(30 - dst.loc_code[pos - 1] as u32) + 1;
                             dst.loc_code[pos] = dst.loc_code[pos - 1]
-                                + bit_reader.read::<i32>(delta_bits as u32)?
+                                + bit_reader.read_unsigned_var::<u32>(delta_bits as u32)? as i32
                                 + 1;
                         }
                     }
@@ -1672,7 +1678,7 @@ fn decode_gainc_loc_codes<'a, R: Read + Seek>(
                     let dst = &mut chan.gain_data[sb];
 
                     let vlc_tab = &GAIN_VLC_TABS[10];
-                    let delta = bit_reader.read_huffman(vlc_tab)?;
+                    let delta = vlc_tab.read(bit_reader)?;
 
                     let pred = if _ref.num_points > 0 {
                         _ref.loc_code[0]
@@ -1686,7 +1692,7 @@ fn decode_gainc_loc_codes<'a, R: Read + Seek>(
                         if dst.lev_code[i] > dst.lev_code[i - 1] {
                             if more_than_ref {
                                 let vlc_tab = &GAIN_VLC_TABS[9];
-                                let delta = bit_reader.read_huffman(vlc_tab)?;
+                                let delta = vlc_tab.read(bit_reader)?;
 
                                 dst.loc_code[i] = dst.loc_code[i - 1] + delta as i32;
                             } else {
@@ -1696,14 +1702,17 @@ fn decode_gainc_loc_codes<'a, R: Read + Seek>(
                                         let pos = i;
 
                                         if !(pos > 0) || dst.loc_code[pos - 1] < 15 {
-                                            dst.loc_code[pos] = bit_reader.read::<i32>(5)?;
+                                            dst.loc_code[pos] =
+                                                bit_reader.read_unsigned_var::<u32>(5)? as i32;
                                         } else if dst.loc_code[pos - 1] >= 30 {
                                             dst.loc_code[pos] = 31;
                                         } else {
                                             let delta_bits =
                                                 log2(30 - dst.loc_code[pos - 1] as u32) + 1;
                                             dst.loc_code[pos] = dst.loc_code[pos - 1]
-                                                + bit_reader.read::<i32>(delta_bits as u32)?
+                                                + bit_reader
+                                                    .read_unsigned_var::<u32>(delta_bits as u32)?
+                                                    as i32
                                                 + 1;
                                         }
                                     }
@@ -1717,7 +1726,7 @@ fn decode_gainc_loc_codes<'a, R: Read + Seek>(
                             } else {
                                 &GAIN_VLC_TABS[10]
                             };
-                            let delta = bit_reader.read_huffman(vlc_tab)?;
+                            let delta = vlc_tab.read(bit_reader)?;
 
                             if more_than_ref {
                                 dst.loc_code[i] = dst.loc_code[i - 1] + delta as i32;
@@ -1734,7 +1743,7 @@ fn decode_gainc_loc_codes<'a, R: Read + Seek>(
                         let dst = &mut chan.gain_data[sb];
 
                         if dst.num_points > 0 {
-                            dst.loc_code[0] = bit_reader.read::<i32>(5)?;
+                            dst.loc_code[0] = bit_reader.read_unsigned_var::<u32>(5)? as i32;
 
                             for i in 1..dst.num_points as usize {
                                 let vlc_tab = if dst.lev_code[i] <= dst.lev_code[i - 1] {
@@ -1744,7 +1753,7 @@ fn decode_gainc_loc_codes<'a, R: Read + Seek>(
                                 };
 
                                 dst.loc_code[i] =
-                                    dst.loc_code[i - 1] + bit_reader.read_huffman(vlc_tab)? as i32;
+                                    dst.loc_code[i - 1] + vlc_tab.read(bit_reader)? as i32;
                             }
                         }
                     }
@@ -1765,7 +1774,7 @@ fn decode_gainc_loc_codes<'a, R: Read + Seek>(
                         // loc_mode1
                         {
                             if dst.num_points > 0 {
-                                dst.loc_code[0] = bit_reader.read::<i32>(5)?;
+                                dst.loc_code[0] = bit_reader.read_unsigned_var::<u32>(5)? as i32;
 
                                 for i in 1..dst.num_points as usize {
                                     let vlc_tab = if dst.lev_code[i] <= dst.lev_code[i - 1] {
@@ -1774,8 +1783,8 @@ fn decode_gainc_loc_codes<'a, R: Read + Seek>(
                                         &GAIN_VLC_TABS[9]
                                     };
 
-                                    dst.loc_code[i] = dst.loc_code[i - 1]
-                                        + bit_reader.read_huffman(vlc_tab)? as i32;
+                                    dst.loc_code[i] =
+                                        dst.loc_code[i - 1] + vlc_tab.read(bit_reader)? as i32;
                                 }
                             }
                         }
@@ -1793,13 +1802,13 @@ fn decode_gainc_loc_codes<'a, R: Read + Seek>(
                         let pos = i;
 
                         if !(pos > 0) || dst.loc_code[pos - 1] < 15 {
-                            dst.loc_code[pos] = bit_reader.read::<i32>(5)?;
+                            dst.loc_code[pos] = bit_reader.read_unsigned_var::<u32>(5)? as i32;
                         } else if dst.loc_code[pos - 1] >= 30 {
                             dst.loc_code[pos] = 31;
                         } else {
                             let delta_bits = log2(30 - dst.loc_code[pos - 1] as u32) + 1;
                             dst.loc_code[pos] = dst.loc_code[pos - 1]
-                                + bit_reader.read::<i32>(delta_bits as u32)?
+                                + bit_reader.read_unsigned_var::<u32>(delta_bits as u32)? as i32
                                 + 1;
                         }
                     }
@@ -1811,7 +1820,7 @@ fn decode_gainc_loc_codes<'a, R: Read + Seek>(
                     }
 
                     let mut vlc_tab = &GAIN_VLC_TABS[6];
-                    let delta = bit_reader.read_huffman(vlc_tab)?;
+                    let delta = vlc_tab.read(bit_reader)?;
 
                     let pred = if chan.gain_data[sb - 1].num_points > 0 {
                         chan.gain_data[sb - 1].loc_code[0]
@@ -1837,7 +1846,7 @@ fn decode_gainc_loc_codes<'a, R: Read + Seek>(
                             + if more_than_ref { 1 } else { 0 }
                             + 6];
 
-                        let delta = bit_reader.read_huffman(vlc_tab)? as i32;
+                        let delta = vlc_tab.read(bit_reader)? as i32;
 
                         if more_than_ref {
                             chan.gain_data[sb].loc_code[i] =
@@ -1861,13 +1870,15 @@ fn decode_gainc_loc_codes<'a, R: Read + Seek>(
                                 let pos = i;
 
                                 if !(pos > 0) || dst.loc_code[pos - 1] < 15 {
-                                    dst.loc_code[pos] = bit_reader.read::<i32>(5)?;
+                                    dst.loc_code[pos] =
+                                        bit_reader.read_unsigned_var::<u32>(5)? as i32;
                                 } else if dst.loc_code[pos - 1] >= 30 {
                                     dst.loc_code[pos] = 31;
                                 } else {
                                     let delta_bits = log2(30 - dst.loc_code[pos - 1] as u32) + 1;
                                     dst.loc_code[pos] = dst.loc_code[pos - 1]
-                                        + bit_reader.read::<i32>(delta_bits as u32)?
+                                        + bit_reader.read_unsigned_var::<u32>(delta_bits as u32)?
+                                            as i32
                                         + 1;
                                 }
                             }
@@ -1877,13 +1888,14 @@ fn decode_gainc_loc_codes<'a, R: Read + Seek>(
                     }
                 }
             } else {
-                let delta_bits = bit_reader.read::<u32>(2)? + 1;
-                let min_val = bit_reader.read::<i32>(5)?;
+                let delta_bits = bit_reader.read_var::<u32>(2)? + 1;
+                let min_val = bit_reader.read_unsigned_var::<u32>(5)? as i32;
 
                 for sb in 0..coded_subbands {
                     for i in 0..chan.gain_data[sb].num_points as usize {
-                        chan.gain_data[sb].loc_code[i] =
-                            min_val + i as i32 + bit_reader.read::<i32>(delta_bits)?;
+                        chan.gain_data[sb].loc_code[i] = min_val
+                            + i as i32
+                            + bit_reader.read_unsigned_var::<u32>(delta_bits)? as i32;
                     }
                 }
             }
@@ -1921,7 +1933,7 @@ fn decode_tones_info<'a, R: Read + Seek>(
         }
     }
 
-    channel_unit.waves_info.tones_present = bit_reader.read::<i32>(1)?;
+    channel_unit.waves_info.tones_present = bit_reader.read_unsigned_var::<u32>(1)? as i32;
 
     if !(channel_unit.waves_info.tones_present > 0) {
         return Ok(());
@@ -1931,13 +1943,13 @@ fn decode_tones_info<'a, R: Read + Seek>(
         channel_unit.waves_info.waves[i] = WaveParam::default();
     }
 
-    channel_unit.waves_info.amplitude_mode = bit_reader.read::<i32>(1)?;
+    channel_unit.waves_info.amplitude_mode = bit_reader.read_unsigned_var::<u32>(1)? as i32;
     if !(channel_unit.waves_info.amplitude_mode > 0) {
         return Err(Error::Other("GHA amplitude mode 0"));
     }
 
     let vlc_tab = &TONE_VLC_TABS[0];
-    channel_unit.waves_info.num_tone_bands = bit_reader.read_huffman(vlc_tab)? as i32 + 1;
+    channel_unit.waves_info.num_tone_bands = vlc_tab.read(bit_reader)? as i32 + 1;
 
     if num_channels == 2 {
         get_subband_flags(
@@ -2013,16 +2025,16 @@ fn decode_tones_envelope<'a, R: Read + Seek>(
                 continue;
             }
 
-            dst[sb].pend_env.has_start_point = bit_reader.read::<i32>(1)?;
+            dst[sb].pend_env.has_start_point = bit_reader.read_unsigned_var::<u32>(1)? as i32;
             dst[sb].pend_env.start_pos = if dst[sb].pend_env.has_start_point > 0 {
-                bit_reader.read::<i32>(5)?
+                bit_reader.read_unsigned_var::<u32>(5)? as i32
             } else {
                 -1
             };
 
-            dst[sb].pend_env.has_stop_point = bit_reader.read::<i32>(1)?;
+            dst[sb].pend_env.has_stop_point = bit_reader.read_unsigned_var::<u32>(1)? as i32;
             dst[sb].pend_env.stop_pos = if dst[sb].pend_env.has_stop_point > 0 {
-                bit_reader.read::<i32>(5)?
+                bit_reader.read_unsigned_var::<u32>(5)? as i32
             } else {
                 32
             };
@@ -2060,14 +2072,14 @@ fn decode_band_numwavs<'a, R: Read + Seek>(
     ch_num: usize,
     band_has_tones: &'a [i32],
 ) -> Result<(), Error> {
-    let mode = bit_reader.read::<u8>(ch_num as u32 + 1)?;
+    let mode = bit_reader.read_var::<u8>(ch_num as u32 + 1)?;
     match mode {
         0 => {
             let dst = &mut channel_unit.channels[ch_num].tones_info;
 
             for sb in 0..channel_unit.waves_info.num_tone_bands as usize {
                 if band_has_tones[sb] > 0 {
-                    dst[sb].num_wavs = bit_reader.read::<i32>(4)?;
+                    dst[sb].num_wavs = bit_reader.read_unsigned_var::<u32>(4)? as i32;
                 }
             }
         }
@@ -2077,7 +2089,7 @@ fn decode_band_numwavs<'a, R: Read + Seek>(
             for sb in 0..channel_unit.waves_info.num_tone_bands as usize {
                 if band_has_tones[sb] > 0 {
                     let vlc_tab = &TONE_VLC_TABS[1];
-                    dst[sb].num_wavs = bit_reader.read_huffman(&vlc_tab)? as i32;
+                    dst[sb].num_wavs = vlc_tab.read(bit_reader)? as i32;
                 }
             }
         }
@@ -2085,7 +2097,7 @@ fn decode_band_numwavs<'a, R: Read + Seek>(
             for sb in 0..channel_unit.waves_info.num_tone_bands as usize {
                 if band_has_tones[sb] > 0 {
                     let vlc_tab = &TONE_VLC_TABS[2];
-                    let mut delta = bit_reader.read_huffman(&vlc_tab)? as i32;
+                    let mut delta = vlc_tab.read(bit_reader)? as i32;
                     delta = sign_extend(delta, 3);
 
                     let ref_num_wavs = channel_unit.channels[0].tones_info[sb].num_wavs;
@@ -2144,30 +2156,33 @@ fn decode_tones_frequency<'a, R: Read + Seek>(
 
             let mut iwav = &mut channel_unit.waves_info.waves[dst[sb].start_index as usize..];
             let direction = if dst[sb].num_wavs > 1 {
-                bit_reader.read::<i32>(1)?
+                bit_reader.read_unsigned_var::<u32>(1)? as i32
             } else {
                 0
             };
 
             if direction > 0 {
                 if dst[sb].num_wavs > 0 {
-                    iwav[dst[sb].num_wavs as usize - 1].freq_index = bit_reader.read::<i32>(10)?;
+                    iwav[dst[sb].num_wavs as usize - 1].freq_index =
+                        bit_reader.read_unsigned_var::<u32>(10)? as i32;
                 }
 
                 let mut i = dst[sb].num_wavs - 2;
                 while i >= 0 {
                     let nbits = log2(iwav[i as usize + 1].freq_index as u32) + 1;
-                    iwav[i as usize].freq_index = bit_reader.read::<i32>(nbits as u32)?;
+                    iwav[i as usize].freq_index =
+                        bit_reader.read_unsigned_var::<u32>(nbits as u32)? as i32;
                     i -= 1;
                 }
             } else {
                 for i in 0..dst[sb].num_wavs as usize {
                     if !(i > 0) || iwav[i - 1].freq_index < 512 {
-                        iwav[i].freq_index = bit_reader.read::<i32>(10)?;
+                        iwav[i].freq_index = bit_reader.read_unsigned_var::<u32>(10)? as i32;
                     } else {
                         let nbits = log2(1023 - iwav[i - 1].freq_index as u32) + 1;
                         iwav[i].freq_index =
-                            bit_reader.read::<i32>(nbits as u32)? + 1024 - (1 << nbits);
+                            bit_reader.read_unsigned_var::<u32>(nbits as u32)? as i32 + 1024
+                                - (1 << nbits);
                     }
                 }
             }
@@ -2182,7 +2197,7 @@ fn decode_tones_frequency<'a, R: Read + Seek>(
 
             for i in 0..channel_unit.channels[ch_num].tones_info[sb].num_wavs as usize {
                 let vlc_tab = &TONE_VLC_TABS[6];
-                let mut delta = bit_reader.read_huffman(vlc_tab)? as i32;
+                let mut delta = vlc_tab.read(bit_reader)? as i32;
                 delta = sign_extend(delta, 8);
 
                 let iwav = &channel_unit.waves_info.waves
@@ -2253,7 +2268,7 @@ fn decode_tones_amplitude<'a, R: Read + Seek>(
 
     let dst = &mut channel_unit.channels[ch_num].tones_info;
 
-    let mode = bit_reader.read::<u8>(ch_num as u32 + 1)?;
+    let mode = bit_reader.read_var::<u8>(ch_num as u32 + 1)?;
     match mode {
         0 => {
             for sb in 0..channel_unit.waves_info.num_tone_bands as usize {
@@ -2264,11 +2279,11 @@ fn decode_tones_amplitude<'a, R: Read + Seek>(
                 if channel_unit.waves_info.amplitude_mode > 0 {
                     for i in 0..dst[sb].num_wavs as usize {
                         channel_unit.waves_info.waves[dst[sb].start_index as usize + i].amp_sf =
-                            bit_reader.read::<i32>(6)?;
+                            bit_reader.read_unsigned_var::<u32>(6)? as i32;
                     }
                 } else {
                     channel_unit.waves_info.waves[dst[sb].start_index as usize].amp_sf =
-                        bit_reader.read::<i32>(6)?;
+                        bit_reader.read_unsigned_var::<u32>(6)? as i32;
                 }
             }
         }
@@ -2282,12 +2297,12 @@ fn decode_tones_amplitude<'a, R: Read + Seek>(
                     for i in 0..dst[sb].num_wavs as usize {
                         let vlc_tab = &TONE_VLC_TABS[3];
                         channel_unit.waves_info.waves[dst[sb].start_index as usize + i].amp_sf =
-                            bit_reader.read_huffman(vlc_tab)? as i32 + 20;
+                            vlc_tab.read(bit_reader)? as i32 + 20;
                     }
                 } else {
                     let vlc_tab = &TONE_VLC_TABS[4];
                     channel_unit.waves_info.waves[dst[sb].start_index as usize].amp_sf =
-                        bit_reader.read_huffman(vlc_tab)? as i32 + 24;
+                        vlc_tab.read(bit_reader)? as i32 + 24;
                 }
             }
         }
@@ -2299,7 +2314,7 @@ fn decode_tones_amplitude<'a, R: Read + Seek>(
 
                 for i in 0..dst[sb].num_wavs as usize {
                     let vlc_tab = &TONE_VLC_TABS[5];
-                    let mut delta = bit_reader.read_huffman(vlc_tab)? as i32;
+                    let mut delta = vlc_tab.read(bit_reader)? as i32;
                     delta = sign_extend(delta, 5);
                     let pred = if refwaves[dst[sb].start_index as usize + i] >= 0 {
                         channel_unit.waves_info.waves
@@ -2353,7 +2368,7 @@ fn decode_tones_phase<'a, R: Read + Seek>(
 
         let wparam = &mut channel_unit.waves_info.waves[dst[sb].start_index as usize..];
         for i in 0..dst[sb].num_wavs as usize {
-            wparam[i].phase_index = bit_reader.read::<i32>(5)?;
+            wparam[i].phase_index = bit_reader.read_unsigned_var::<u32>(5)? as i32;
         }
     }
 
@@ -2648,19 +2663,4 @@ fn align_to_block<R: Read + Seek>(
     reader.seek(SeekFrom::Current(bytes_to_align.round() as i64))?;
 
     Ok(BitReader::new(reader))
-}
-
-fn init_static() {
-    lazy_static::initialize(&WL_VLC_TABS);
-    lazy_static::initialize(&SF_VLC_TABS);
-    lazy_static::initialize(&CT_VLC_TABS);
-    lazy_static::initialize(&GAIN_VLC_TABS);
-    lazy_static::initialize(&TONE_VLC_TABS);
-    lazy_static::initialize(&SINE_64);
-    lazy_static::initialize(&SINE_128);
-    lazy_static::initialize(&SINE_TABLE);
-    lazy_static::initialize(&HANN_WINDOW);
-    lazy_static::initialize(&AMP_SF_TAB);
-    lazy_static::initialize(&SPECTRA_TABS);
-    lazy_static::initialize(&SPEC_VLC_TABS);
 }

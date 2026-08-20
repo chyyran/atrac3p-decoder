@@ -8,7 +8,7 @@ the `.at3` / `.wav` RIFF WAV container format.
 
 ## Rodio Source
 
-`Decoder` implies rodio's `Source` trait, as well as `Iterator`. 
+`Decoder` implements rodio's `Source` trait, as well as `Iterator`.
 
 ## Example with Rodio
 
@@ -24,12 +24,11 @@ fn main() -> Result<(), Error> {
 
     let decoder = atrac3p_decoder::Decoder::new(reader)?;
 
-    let device = rodio::default_output_device().unwrap();
-    let sink = rodio::Sink::new(&device);
+    let output = rodio::DeviceSinkBuilder::open_default_sink()?;
+    let player = rodio::Player::connect_new(output.mixer());
 
-    sink.append(decoder);
-    sink.play();
-    sink.sleep_until_end();
+    player.append(decoder);
+    player.sleep_until_end();
 
     Ok(())
 }

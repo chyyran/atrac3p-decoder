@@ -6,7 +6,7 @@ edition = "2018"
 
 [dependencies]
 atrac3p-decoder = { path = "../" }
-rodio = { version = "0.11", default-features = false }
+rodio = { version = "0.22.2", default-features = false, features = ["playback"] }
 
 anyhow = "1.0"
 env_logger = "0.7"

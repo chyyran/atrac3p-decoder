@@ -13,15 +13,14 @@ categories = ["multimedia::audio", "multimedia::encoding"]
 
 
 [dependencies]
-bitstream-io = "0.8"
-lazy_static = "1.4"
+bitstream-io = "4.10.0"
 log = "0.4"
-num = "0.2"
+num = "0.4.3"
 riff-wave-reader = "0.1"
-rodio = { version = "0.11", default-features = false }
+rodio = { version = "0.22.2", default-features = false }
 rustdct = "0.4"
 take_mut = "0.2"
-thiserror = "1.0"
+thiserror = "2"
 
 [workspace]
 members = [
